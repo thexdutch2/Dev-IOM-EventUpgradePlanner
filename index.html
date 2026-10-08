@@ -1610,7 +1610,7 @@ const Engine = (function () {
   }
   $('#btnReset').addEventListener('click', () => {
     if (!window.confirm('Reset all inputs to their defaults?')) return;
-    const keep = S.ui; S = defaults(); S.ui = keep; S.ui.setupDone = false; S.ui.gemSkip = null; OV = [null, null, null, null]; save(); lastGemInfo = null; buildInputs(); compute();
+    const keep = S.ui; S = defaults(); S.ui = keep; S.ui.setupDone = false; S.ui.nextW = null; S.ui.lastRoute = null; S.ui.gemSkip = null; OV = [null, null, null, null]; save(); lastGemInfo = null; buildInputs(); compute();
   });
   // Plan / Setup tabs (phones and narrow windows only; wide screens show both)
   function setTab(t) {
@@ -1648,8 +1648,62 @@ const Engine = (function () {
     saveRouteCache();
     return r.value;
   }
+  // Tries the prestige waves around `path` (the first two prestiges on a grid, later ones one at a time) with the plan's exact
+  // timing settings. Returns the fastest { path, r }. The current next-prestige wave is kept unless another is clearly (1%) faster.
+  const REFINE_KEY = 'evcalc.refine1';
+  let REFINE_CACHE = {};
+  try { REFINE_CACHE = JSON.parse(localStorage.getItem(REFINE_KEY) || '{}') || {}; } catch (e) { REFINE_CACHE = {}; }
+  function saveRefine(k, v) {
+    REFINE_CACHE[k] = v;
+    const ks = Object.keys(REFINE_CACHE); if (ks.length > 40) ks.slice(0, ks.length - 40).forEach(x => delete REFINE_CACHE[x]);
+    try { localStorage.setItem(REFINE_KEY, JSON.stringify(REFINE_CACHE)); } catch (e) { /* storage unavailable */ }
+  }
+  function* refineRoute(n, policy, lambda, exact, path, r0) {
+    const key = p => p.map(m => m[0]).join(',');
+    const mk = ws => ws.map(w => [w, E.tierOfWave(w)]);
+    const valid = p => {
+      let pw = 0, pt = n.P;
+      for (const m of p) { if (m[0] < 10 || m[1] <= pt || m[0] >= n.goal || (pw && m[0] < pw * 1.2)) return false; pw = m[0]; pt = m[1]; }
+      return true;
+    };
+    const seen = new Map([[key(path), { path, r: r0 }]]);
+    let best = seen.get(key(path));
+    function* tryWaves(ws) {
+      const p = mk(ws), k = key(p);
+      if (seen.has(k) || !valid(p)) return;
+      const gen = E.simulateGen(simOpts(n, policy.arg, lambda, null, p, exact));
+      let g = gen.next();
+      while (!g.done) { yield 'refine'; g = gen.next(); }
+      const c = { path: p, r: g.value };
+      seen.set(k, c);
+      if (better(c.r, best.r)) best = c;
+    }
+    // grid over two prestiges: the next two for a short route, the two highest for a long one (early waves matter little)
+    const base = path.map(m => m[0]), L = base.length;
+    const gi = L <= 2 ? [0, 1] : [L - 2, L - 1];
+    // a recalculation in the same tier starts from a route already checked, so a tighter grid plus that route is enough
+    const prev = S.ui.lastRoute && S.ui.lastRoute.P === n.P && S.ui.lastRoute.goal === n.goal ? S.ui.lastRoute.ws : null;
+    const offs = L <= 2 && !prev ? [-10, -5, 0, 5, 10] : [-5, 0, 5];
+    if (prev) { yield* tryWaves(prev); for (const d of [-5, 5]) { const ws = prev.slice(); ws[0] += d; yield* tryWaves(ws); } }
+    for (const a of offs) for (const b of (L > 1 ? offs : [0])) {
+      const ws = base.slice(); ws[gi[0]] += a; if (L > 1) ws[gi[1]] += b;
+      yield* tryWaves(ws);
+    }
+    for (let i = 0; i < L; i++) if (gi.indexOf(i) < 0) for (const d of [-5, 5]) {
+      const ws = best.path.map(m => m[0]); ws[i] += d;
+      yield* tryWaves(ws);
+    }
+    // stickiness: a recalculation does not flip the next prestige wave for a tiny gain
+    const stick = S.ui.nextW && S.ui.nextW.P === n.P ? S.ui.nextW.w : null;
+    if (stick != null && best.r.attainable && best.path[0][0] !== stick) {
+      let keep = null;
+      seen.forEach(c => { if (c.path[0][0] === stick && c.r.attainable && (!keep || c.r.completionH < keep.r.completionH)) keep = c; });
+      if (keep && keep.r.completionH <= best.r.completionH * 1.01) best = keep;
+    }
+    return best;
+  }
   function* pipeline(n0) {
-    const route = yield* routeSearch(n0);
+    let route = yield* routeSearch(n0);
     const owned = usesGems() ? n0.ownedGems : { atk: 0, hp: 0, speed: 0, x2: 0 };
     const gemFor = tier => (tier === n0.P && n0.gemSkip) ? owned : E.gemsFor(tier, owned, route.G);
     // the plan assumes the recommended gem upgrades for this tier are bought (unless the player continues without them)
@@ -1683,17 +1737,36 @@ const Engine = (function () {
       yield 'own';
       chosen = sim(n, iv, lambda); policy = { type: 'fixed', iv, arg: iv };
     }
-    const pathArg = route.path;
     // Auto timing: every recommended visit must lift the theoretical max wave by the chosen minimum (pausable, so the page stays responsive)
-    if (policy.type === 'auto') {
-      const mp = minProgOf(n.minProg);
-      if (mp.waves || mp.pct) {
-        const gen = E.simulateGen(simOpts(n, policy.arg, lambda, null, pathArg, { minWaves: mp.waves, minProgress: mp.pct }));
-        let r = gen.next();
-        while (!r.done) { yield 'minprog'; r = gen.next(); }
-        chosen = r.value;
-      }
+    const mp = minProgOf(n.minProg);
+    const exact = policy.type === 'auto' && (mp.waves || mp.pct) ? { minWaves: mp.waves, minProgress: mp.pct } : {};
+    if (exact.minWaves != null) {
+      const gen = E.simulateGen(simOpts(n, policy.arg, lambda, null, route.path, exact));
+      let r = gen.next();
+      while (!r.done) { yield 'minprog'; r = gen.next(); }
+      chosen = r.value;
     }
+    // The route search ranks routes with a simpler timing rule so it stays quick. Re-check the routes around its pick with the
+    // player's exact settings (the ones the plan uses) and keep the fastest.
+    if (route.path.length) {
+      // the result for an unchanged setup is remembered, so a reload does not repeat the check
+      const rkey = JSON.stringify([n0.P, n0.lv, n0.cur.map(Math.round), owned, n0.gemPref, !!n0.gemSkip, n.goal, n0.interval, n0.minProg]);
+      const known = REFINE_CACHE[rkey];
+      let best;
+      if (known && known.length) {
+        const p = known.map(w => [w, E.tierOfWave(w)]);
+        const gen = E.simulateGen(simOpts(n, policy.arg, lambda, null, p, exact));
+        let g = gen.next();
+        while (!g.done) { yield 'minprog'; g = gen.next(); }
+        best = { path: known.join() === route.path.map(m => m[0]).join() ? route.path : p, r: g.value };
+      } else {
+        best = yield* refineRoute(n, policy, lambda, exact, route.path, chosen);
+        saveRefine(rkey, best.path.map(m => m[0]));
+      }
+      if (best.path !== route.path) { route = Object.assign({}, route, { path: best.path, refined: true }); n.path = best.path; }
+      chosen = best.r;
+    }
+    const pathArg = route.path;
     // when the original goal is out of reach, see how much longer it would take
     let needH = null, extMax = null;
     if (route.state === 'highest' || !chosen.attainable) {
@@ -1764,9 +1837,10 @@ const Engine = (function () {
     function step() {
       if (my !== token) return;
       let r;
-      try { r = gen.next(); } catch (err) { if (window.console) console.error(err); $('#sbBig').textContent = 'Calculation error'; $('#sbSub').textContent = 'Please refresh the page and try again.'; setBusy(false); return; }
+      const t0 = performance.now();   // work in ~15 ms slices: fast, and the page stays responsive
+      try { do { r = gen.next(); } while (!r.done && performance.now() - t0 < 15); } catch (err) { if (window.console) console.error(err); $('#sbBig').textContent = 'Calculation error'; $('#sbSub').textContent = 'Please refresh the page and try again.'; setBusy(false); return; }
       if (r.done) { const bt = $('#sbMain .busytag'); if (bt) bt.textContent = 'Updating'; render(r.value.n, r.value); setBusy(false); }
-      else { const bt = $('#sbMain .busytag'); if (bt) bt.textContent = r.value === 'route' ? 'Working out your prestige path' : 'Updating'; setTimeout(step, 0); }
+      else { const bt = $('#sbMain .busytag'); if (bt) bt.textContent = r.value === 'route' ? 'Working out your prestige path' : r.value === 'refine' ? 'Checking nearby routes' : 'Updating'; setTimeout(step, 0); }
     }
     setTimeout(step, 20);
   }
@@ -2016,7 +2090,7 @@ const Engine = (function () {
   }
   function prestigeDone() {
     OV = [null, null, null, null];
-    S.P = PLAN.tier; S.lv = {}; S.cur = [0, 0, 0, 0]; S.lastCheckin = null; S.curAt = Date.now(); S.ui.gemSkip = null; S.ui.nextW = null;
+    S.P = PLAN.tier; S.lv = {}; S.cur = [0, 0, 0, 0]; S.lastCheckin = null; S.curAt = Date.now(); S.ui.gemSkip = null; S.ui.nextW = null; S.ui.lastRoute = null;
     save(); buildInputs(); compute();
   }
 
@@ -2132,7 +2206,8 @@ const Engine = (function () {
     PLAN.route = route; PLAN.owned = R.owned; PLAN.startGems = n.gems;
     PLAN.gemBuys = usesGems() ? gemBuyList(R.owned, n.gems) : [];
     PLAN.firstPres = ev.find(e => e.type === 'prestige') || null;
-    S.ui.nextW = route.path.length ? { P: n.P, w: route.path[0][0] } : null; save();   // a later recalculation keeps this wave unless another is clearly (1%) faster
+    S.ui.nextW = route.path.length ? { P: n.P, w: route.path[0][0] } : null;
+    S.ui.lastRoute = route.path.length ? { P: n.P, goal: n.goal, ws: route.path.map(m => m[0]) } : null; save();   // a later recalculation keeps this wave unless another is clearly (1%) faster
 
     // one-line summary under the time-between-sets setting
     const sets = ev.filter(e => e.type === 'checkin' && e.buys.length).length;
@@ -2292,7 +2367,8 @@ const Engine = (function () {
      Item kinds: 'new' (something you can now do), 'changed' (something works differently or better), 'fix' (a problem that is now solved).
      Note: blocks dated Sep 26 and earlier carry illustrative dates spread over a month. Real dates start with the Oct 3 block. */
   const CHANGELOG = [
-    { id: '2026-10-08-1', date: '2026-10-08', title: 'Updates', items: [
+    { id: '2026-10-08-2', date: '2026-10-08', title: 'Updates', items: [
+      ['fix', 'The prestige path is now checked against your exact timing settings (Auto time between sets and minimum progress per visit) before it is shown. Previously a quicker check could pick a route that was several hours slower under those settings. The first calculation can take longer, up to about 35 seconds at the start of an event; reloading an unchanged setup is quick.'],
       ['fix', 'The planner no longer recommends prestiging at a fixed wave (such as W160 or W105) when a different prestige wave finishes the goal sooner.'],
       ['changed', 'Prestige waves are no longer fixed milestones. The planner searches for the route that reaches your goal in the least time, using your Auto timing and minimum progress per visit settings. The Breakpoints table follows that route.'],
       ['changed', 'The plan is recalculated when you check in and when you finish setup. After you edit a value by hand, it recalculates about 10 seconds later, in case you upgraded in game.'],
@@ -2517,7 +2593,7 @@ const Engine = (function () {
     S.gemPref = !o.useGems ? 'none' : (o.pref === 2 ? 'fast' : 'min'); S.ui.gemSkip = null; S.gems = { hp: o.hp, atk: o.atk, speed: o.speed, x2: o.x2 };
     S.cur = o.cur.slice(); S.lv = {}; E.UPG.forEach((up, i) => { S.lv[up.id] = o.lv[i]; });
     blankRowsAbove().forEach(w => { S.lv[w.id] = 1; });
-    S.curAt = Date.now(); S.lastCheckin = null; OV = [null, null, null, null]; S.ui.setupDone = true;
+    S.curAt = Date.now(); S.lastCheckin = null; OV = [null, null, null, null]; S.ui.setupDone = true; S.ui.nextW = null; S.ui.lastRoute = null;
     save(); lastGemInfo = null; buildInputs(); compute();
   }
   const dlg = $('#codeDlg');
